@@ -98,6 +98,87 @@ LOOSE_EPIC_REGEX = re.compile(r'^[A-Z]{2,4}[0-9]{6,8}$')
 DEVANAGARI_REGEX = re.compile(r'[\u0900-\u097F]')
 NUMBER_CLEANUP_REGEX = re.compile(r'[0-9,]+')
 
+# Gender extraction patterns (Maharashtra voter list: age + gender often on one line)
+GENDER_LINE_PATTERNS = [
+    re.compile(r'लिंग\s*[:\-]?\s*(पु|स्त्री|स्री|पुरुष|महिला)', re.IGNORECASE),
+    re.compile(r'(?:वय|age)\s*[:\-]?\s*\d{1,3}\s*[/\s,]+\s*(पु|स्त्री|स्री|पुरुष|महिला)', re.IGNORECASE),
+    re.compile(r'(\d{1,3})\s*(?:वर्ष)?\s*[/\s]+\s*(पु|स्त्री|स्री)\b'),
+    re.compile(r'(\d{1,3})\s+(पु|स्त्री|स्री)\b'),
+    re.compile(r'\b(पु|स्त्री|स्री)\b'),
+]
+
+MALE_GENDER_EXACT = frozenset([
+    'पु', 'पुरुष', 'प', 'पन', 'पक', '2पक', '2 पक', '2 प', 'पक्', 'पू', 'पम', 'पर', '2',
+    'M', 'MALE', 'PURUSH',
+])
+FEMALE_GENDER_EXACT = frozenset([
+    'स्री', 'स्त्री', 'महिला', 'स्री.', 'स्त्री.', 'सण', 'सद', 'सत',
+    'F', 'FEMALE', 'STRI', 'MAHILA',
+])
+
+
+def extract_gender_from_text(text: str) -> str:
+    """Parse gender (पु / स्री) from field OCR, text layer, or full cell text."""
+    if not text:
+        return ""
+
+    raw = str(text).strip()
+    upper = raw.upper()
+
+    if re.search(r'\bFEMALE\b', upper) or (re.search(r'\bF\b', upper) and not re.search(r'\bMALE\b', upper)):
+        return "स्री"
+    if re.search(r'\bMALE\b', upper) or re.search(r'\bM\b', upper):
+        return "पु"
+
+    for pattern in GENDER_LINE_PATTERNS:
+        match = pattern.search(raw)
+        if match:
+            token = match.group(match.lastindex) if match.lastindex else match.group(0)
+            normalized = normalize_gender_value(token)
+            if normalized:
+                return normalized
+
+    return normalize_gender_value(raw)
+
+
+def normalize_gender_value(raw: str) -> str:
+    """Map OCR/token text to standard Marathi gender labels."""
+    if not raw:
+        return ""
+
+    val = re.sub(r'[^\w\s\u0900-\u097F]', '', str(raw)).strip()
+    if not val:
+        return ""
+
+    val_compact = val.replace(' ', '')
+    if val_compact in FEMALE_GENDER_EXACT or val in FEMALE_GENDER_EXACT:
+        return "स्री"
+    if val_compact in MALE_GENDER_EXACT or val in MALE_GENDER_EXACT:
+        return "पु"
+
+    # Token-level match (avoid substring false positives like 'प' inside names)
+    for token in val.split():
+        t = token.strip()
+        if t in FEMALE_GENDER_EXACT:
+            return "स्री"
+        if t in MALE_GENDER_EXACT:
+            return "पु"
+
+    mapped = TranslitHelper.map_gender(val)
+    if mapped == "Male":
+        return "पु"
+    if mapped == "Female":
+        return "स्री"
+    return ""
+
+
+def apply_gender_to_fields(additional_fields: dict, gender_val: str) -> None:
+    """Store gender on the record using standard Excel keys."""
+    if not gender_val:
+        return
+    additional_fields['gender'] = gender_val
+    additional_fields['genderEnglish'] = TranslitHelper.map_gender(gender_val)
+
 # Get CPU count for multiprocessing
 def get_cpu_count():
     """Get optimal CPU count for multiprocessing - USE ALL CORES!"""
@@ -138,6 +219,31 @@ def _extract_cell_internal(page, page_num, cell_info, config, extraction_limits,
         # Skip only if cell is completely in header zone OR completely in footer zone
         if cell_bottom <= extraction_y_start or cell_y >= extraction_y_end:
             return None
+
+        # Skip only visually empty cells (do not require voter ID to process)
+        cell_full_rect_early = fitz.Rect(
+            cell_x, cell_y,
+            cell_x + cell_width_actual,
+            cell_y + cell_height_actual,
+        )
+        if master_page_img and master_page_scale:
+            try:
+                c_left = max(0, int(cell_full_rect_early.x0 * master_page_scale))
+                c_top = max(0, int(cell_full_rect_early.y0 * master_page_scale))
+                c_right = min(
+                    master_page_img.width,
+                    int(cell_full_rect_early.x1 * master_page_scale),
+                )
+                c_bottom = min(
+                    master_page_img.height,
+                    int(cell_full_rect_early.y1 * master_page_scale),
+                )
+                if c_right > c_left and c_bottom > c_top:
+                    empty_probe = master_page_img.crop((c_left, c_top, c_right, c_bottom))
+                    if is_cell_empty(empty_probe, threshold=250):
+                        return {'skipped': True, 'stats': {}, 'reason': 'empty_cell'}
+            except Exception:
+                pass
         
         # Get configuration
         cell_template = config.get('cellTemplate', {})
@@ -591,69 +697,34 @@ def _extract_cell_internal(page, page_num, cell_info, config, extraction_limits,
         print(f"         Voter ID Length: {len(voter_id_text) if voter_id_text else 0}")
         print(f"         Voter ID Confidence: {voter_id_confidence:.2f}")
         print(f"         Has Photo: {bool(photo_base64 and len(photo_base64) > 0)}")
-        
-        # Skip logic - EXTRACT EVERYTHING WITH DATA!
-        # RULE: Never skip if we have ANY data (voter ID OR photo)
-        should_skip = False
-        skip_reason = ""
-        
-        # Check what data we have - LESS STRICT VALIDATION
-        # Accept ANY voter ID that has content and isn't explicitly marked as invalid
-        invalid_voter_ids = ["NO ID", "NOID", "N/A", "NA", "NOT FOUND", "NONE", "NULL", ""]
-        
-        # Check if voter ID is valid (has content and not in invalid list)
-        has_valid_voter_id = False
-        if voter_id_text:
-            voter_id_upper = voter_id_text.upper().strip()
-            # Accept if it's not in the invalid list and has at least 3 characters
-            if voter_id_upper not in invalid_voter_ids and len(voter_id_text.strip()) >= 3:
-                has_valid_voter_id = True
-                print(f"         ✓ Voter ID is VALID: '{voter_id_text}'")
-            else:
-                print(f"         ✗ Voter ID is INVALID: '{voter_id_text}' (reason: {'too short' if len(voter_id_text.strip()) < 3 else 'in invalid list'})")
-        else:
-            print(f"         ✗ Voter ID is EMPTY")
-        
-        has_photo = photo_base64 and len(photo_base64) > 0
-        
-        # CRITICAL: If we have a photo, NEVER skip (even without voter ID)
-        if has_photo:
-            should_skip = False  # Always extract if photo exists
-            print(f"         → Decision: EXTRACT (has photo)")
-        # If we have voter ID but no photo, still extract
-        elif has_valid_voter_id:
-            should_skip = False  # Always extract if voter ID exists
-            print(f"         → Decision: EXTRACT (has valid voter ID)")
-        # Only skip if we have NOTHING
-        else:
-            should_skip = True
-            skip_reason = f"No valid voter ID (got: '{voter_id_text}')"
-            print(f"         → Decision: SKIP ({skip_reason})")
-        
-        # USER REQUEST 2026-01-27: REMOVE STRICT FILTERING
-        # User wants ALL data extracted, even without voter ID.
-        # We only skip if there's absolutely no data at all (handled below).
-        
-        # Check if we have ANY meaningful data
-        has_any_data = has_photo or has_valid_voter_id or (voter_id_text and len(voter_id_text.strip()) > 0)
-        
-        if has_any_data:
-            should_skip = False
-            skip_reason = ""
-        else:
-            should_skip = True
-            skip_reason = "No data found (no photo, no voter ID)"
 
-        # Log the final decision
-        if should_skip:
-            print(f"      ⏭️  SKIP Page {page_num+1}, Row {row+1}, Col {col+1}: {skip_reason}")
+        has_valid_voter_id = False
+        if voter_id_text and local_ocr_processor:
+            match = local_ocr_processor._validate_epic_format(voter_id_text)
+            if match and match.get('epic'):
+                voter_id_text = match['epic']
+                has_valid_voter_id = True
+            else:
+                voter_id_text = "NA"
+                has_valid_voter_id = False
+        elif voter_id_text:
+            v_upper = voter_id_text.upper().strip()
+            if v_upper not in ["NO ID", "NOID", "N/A", "NA", "NOT FOUND", "NONE", "NULL", ""] and len(voter_id_text.strip()) >= 6:
+                has_valid_voter_id = True
+            else:
+                voter_id_text = "NA"
+                has_valid_voter_id = False
         else:
-            voter_id_display = voter_id_text[:20] if voter_id_text else "[No ID]"
-            photo_status = "Yes" if has_photo else "No"
-            print(f"      ✅ EXTRACT Page {page_num+1}, Row {row+1}, Col {col+1}: VoterID='{voter_id_display}', Photo={photo_status}")
-        
-        if should_skip:
-            return {'skipped': True, 'stats': cell_stats}
+            voter_id_text = "NA"
+            has_valid_voter_id = False
+
+        has_photo = bool(photo_base64 and len(photo_base64) > 0)
+        voter_id_display = voter_id_text[:20] if voter_id_text else "[No ID]"
+        photo_status = "Yes" if has_photo else "No"
+        print(
+            f"      ✅ PROCESS Page {page_num+1}, Row {row+1}, Col {col+1}: "
+            f"VoterID='{voter_id_display}', Photo={photo_status}"
+        )
         
         # === EXTRACT FULL MARATHI TEXT ===
         # Try to get text from PDF text layer first (for digital PDFs)
@@ -671,6 +742,7 @@ def _extract_cell_internal(page, page_num, cell_info, config, extraction_limits,
             
             # 1. Try PDF Text Layer
             text_layer_content = page.get_text("text", clip=cell_full_rect).strip()
+            text_layer_content = TranslitHelper.fix_marathi_visual_order(text_layer_content, force_all=True)
             
             # Check for Devanagari (Marathi) characters (Range: \u0900-\u097F)
             # We want to see if the text layer actually contains readable Marathi
@@ -760,15 +832,23 @@ def _extract_cell_internal(page, page_num, cell_info, config, extraction_limits,
 
                     # Determine OCR strategy based on field type
                     force_marathi = False
+                    force_english = False
                     key_lower = field_key.lower()
                     
-                    # 1. Enforce Marathi for Name, Relative Name, Gender, and Age
-                    if 'name' in key_lower or 'relative' in key_lower or 'gender' in key_lower or 'age' in key_lower or 'relation' in key_lower:
-                        force_marathi = True
-                    
-                    # 2. Enforce English/Mixed for House No
-                    if 'house' in key_lower:
+                    # 1. Enforce English for School Name
+                    if 'school' in key_lower:
+                        force_english = True
                         force_marathi = False
+                    # 2. Enforce Marathi for Name, Relative Name, Gender, and Age
+                    elif ('name' in key_lower and 'school' not in key_lower and 'occupat' not in key_lower and 'व्यवसाय' not in key_lower) or 'relative' in key_lower or 'gender' in key_lower or 'age' in key_lower or 'relation' in key_lower:
+                        force_marathi = True
+                    # 3. Enforce English/Mixed for House No
+                    elif 'house' in key_lower:
+                        force_marathi = False
+                    # 4. Occupation: allow both Marathi and English
+                    elif 'occupat' in key_lower or 'व्यवसाय' in key_lower:
+                        force_marathi = False
+                        force_english = False
                     
                     
                     # === CRITICAL OPTIMIZATION: TRY TEXT LAYER FIRST ===
@@ -776,6 +856,7 @@ def _extract_cell_internal(page, page_num, cell_info, config, extraction_limits,
                     layer_text = ""
                     try:
                         layer_text = page.get_text("text", clip=field_rect).strip()
+                        layer_text = TranslitHelper.fix_marathi_visual_order(layer_text, force_all=True)
                     except:
                         pass
                         
@@ -791,9 +872,12 @@ def _extract_cell_internal(page, page_num, cell_info, config, extraction_limits,
                         if 'serial' in key_lower and not any(c.isdigit() for c in layer_text):
                              use_layer_text = False # Serial must have digits
                         
-                        # EXCEPTION: Name, Relative Name, and Gender using Image Processing (User Request for Accuracy)
-                        if 'name' in key_lower or 'relative' in key_lower or 'relation' in key_lower or 'gender' in key_lower:
+                        # EXCEPTION: Name/relative use OCR for accuracy; gender/age/occupation may use text layer
+                        if (('name' in key_lower and 'occupat' not in key_lower and 'व्यवसाय' not in key_lower) or 'relative' in key_lower or 'relation' in key_lower) and 'school' not in key_lower:
                              use_layer_text = False
+
+                        if 'gender' in key_lower and layer_text:
+                            use_layer_text = True
 
                     if use_layer_text:
                         # SUPER FAST PATH: Skip Image Extraction entirely!
@@ -868,11 +952,34 @@ def _extract_cell_internal(page, page_num, cell_info, config, extraction_limits,
                             pdf_page=page if not crop_img else None,
                             rect=field_rect if not crop_img else None,
                             force_marathi=force_marathi,
+                            force_english=force_english,
                             fast_preprocess=(performance_mode == 'fast')
                         )
+
+                        # Gender: dedicated high-precision OCR (small box, single word)
+                        if 'gender' in key_lower and crop_img:
+                            try:
+                                langs = local_ocr_processor.resolve_tesseract_langs(force_marathi=True)
+                                for psm in (10, 7, 13):
+                                    tess_text = pytesseract.image_to_string(
+                                        crop_img,
+                                        lang=langs,
+                                        config=f'--psm {psm} --oem 1',
+                                    ).strip()
+                                    gender_guess = extract_gender_from_text(tess_text)
+                                    if gender_guess:
+                                        field_res = {
+                                            'text': gender_guess,
+                                            'raw_text': tess_text,
+                                            'method': f'gender_psm_{psm}',
+                                        }
+                                        break
+                            except Exception:
+                                pass
                     
                     raw_text = field_res.get('raw_text', '').strip()
                     clean_val = field_res.get('text', '').strip()
+                    clean_val = TranslitHelper.fix_marathi_visual_order(clean_val)
                     
                     # === SPECIAL HANDLING FOR RELATIVE NAME & RELATION TYPE ===
                     if 'relative' in key_lower:
@@ -895,7 +1002,7 @@ def _extract_cell_internal(page, page_num, cell_info, config, extraction_limits,
                         clean_val = re.sub(r'^(पतीचे|वडिलांचे|इतर|आईचे)\s*(नाव|नावं)?[:\-\s]*', '', clean_val).strip()
 
                     # === SPECIAL HANDLING FOR NAME & RELATIVE NAME (Remove Numbers & Asterisks) ===
-                    if 'name' in key_lower or 'relative' in key_lower:
+                    if (('name' in key_lower and 'school' not in key_lower and 'occupat' not in key_lower and 'व्यवसाय' not in key_lower) or 'relative' in key_lower) and 'relation' not in key_lower:
                         # 1. Targeted OCR corrections (e.g., ठोळके -> शेळके)
                         clean_val = TranslitHelper.correct_marathi_ocr(clean_val)
                         
@@ -926,6 +1033,7 @@ def _extract_cell_internal(page, page_num, cell_info, config, extraction_limits,
                         layer_text = page.get_text("text", clip=field_rect).strip()
                         valid_age = validate_age_text(layer_text)
 
+                        embedded_gender = None
                         if valid_age:
                             clean_val = valid_age
                             print(f"         > Age found in Text Layer: {clean_val}")
@@ -939,21 +1047,42 @@ def _extract_cell_internal(page, page_num, cell_info, config, extraction_limits,
                                 print(f"         > Age validation failed for OCR text: '{clean_val}' and Layer text: '{layer_text}'")
                                 clean_val = ""
 
+                        # Age line often contains gender e.g. "25 पु" — capture for gender field
+                        embedded_gender = (
+                            extract_gender_from_text(layer_text)
+                            or extract_gender_from_text(raw_text)
+                            or extract_gender_from_text(clean_val)
+                        )
+                        if embedded_gender:
+                            apply_gender_to_fields(additional_fields, embedded_gender)
+
                      # === SPECIAL HANDLING FOR GENDER ===
                     if 'gender' in key_lower:
-                         # Keep only Marathi/Devanagari characters and remove punctuation
-                         clean_val = re.sub(r'[^\w\s\u0900-\u097F]', '', clean_val).strip()
-
-                         # FIX SPECIFIC OCR ERRORS: Replace incorrect gender extractions with correct values
-                         if any(k in clean_val for k in ['पन', 'पक', '2 पक', '2पक', '2 प', 'प', '2', 'पक्', 'पू', 'पम', 'पर']):
-                             clean_val = "पु"  # Replace with correct Male gender (पु)
-                         elif clean_val in ['स्री', 'स्त्री', 'महिला', 'स्री.', 'स्त्री.']:
-                             clean_val = "स्री"  # Ensure Female gender is properly formatted
+                         gender_parsed = (
+                             extract_gender_from_text(clean_val)
+                             or extract_gender_from_text(raw_text)
+                             or extract_gender_from_text(layer_text)
+                         )
+                         if gender_parsed:
+                             clean_val = gender_parsed
                          else:
-                             # Use TranslitHelper for Gender mapping (handles 'पर' -> 'पु', etc.)
-                             gender_standard = TranslitHelper.map_gender(clean_val)
-                             if gender_standard == "Male": clean_val = "पु"
-                             elif gender_standard == "Female": clean_val = "स्री"
+                             clean_val = normalize_gender_value(clean_val)
+
+                    # === SPECIAL HANDLING FOR SCHOOL NAME ===
+                    if 'school' in key_lower:
+                        clean_val = re.sub(r'^(?:SCHOOL\s*NAME|SCHOOL|COLLEGE|INSTITUTE)[:\- .]*', '', clean_val, flags=re.IGNORECASE)
+                        clean_val = re.sub(r'[:]', '', clean_val).strip()
+                        additional_fields['schoolName'] = clean_val
+
+                    # === SPECIAL HANDLING FOR OCCUPATION ===
+                    if 'occupat' in key_lower or 'व्यवसाय' in key_lower:
+                        clean_val = re.sub(r'^(?:व्यवसाय|OCCUPATION\s*NAME|OCCUPATION|OCC)[:\- .]*', '', clean_val, flags=re.IGNORECASE)
+                        clean_val = re.sub(r'[:]', '', clean_val).strip()
+                        additional_fields['occupation'] = clean_val
+                        if any('\u0900' <= ch <= '\u097F' for ch in clean_val):
+                            additional_fields['occupationEnglish'] = TranslitHelper.transliterate_occupation(clean_val)
+                        else:
+                            additional_fields['occupationEnglish'] = clean_val
 
                     # === SPECIAL HANDLING FOR HOUSE NO ===
                     if 'house' in key_lower:
@@ -1041,21 +1170,30 @@ def _extract_cell_internal(page, page_num, cell_info, config, extraction_limits,
                         # Store cleaned value
                         additional_fields[field_key] = clean_val
 
+                    # Fix visual-order Marathi text for all fields (e.g. ितरपाड -> तिरपाड, िवद्यालय -> विद्यालय)
+                    clean_val = TranslitHelper.fix_marathi_visual_order(clean_val)
                     additional_fields[field_key] = clean_val
                     
                     # === STANDARDIZE KEYS AND ADD ENGLISH VERSIONS ===
                     # Map common variations to standard keys expected by Excel generator
-                    if 'name' in key_lower and 'relative' not in key_lower:
+                    if 'school' in key_lower:
+                        additional_fields['schoolName'] = clean_val  # Standard key
+                    elif 'occupat' in key_lower or 'व्यवसाय' in key_lower:
+                        additional_fields['occupation'] = clean_val
+                        if any('\u0900' <= ch <= '\u097F' for ch in clean_val):
+                            additional_fields['occupationEnglish'] = TranslitHelper.transliterate_occupation(clean_val)
+                        else:
+                            additional_fields['occupationEnglish'] = clean_val
+                    elif 'name' in key_lower and 'relative' not in key_lower and 'school' not in key_lower and 'occupat' not in key_lower and 'व्यवसाय' not in key_lower:
+                        clean_val = TranslitHelper.correct_marathi_ocr(clean_val)
                         additional_fields['name'] = clean_val  # Standard key
                         additional_fields['nameEnglish'] = TranslitHelper.transliterate_marathi_to_english(clean_val)
                     elif 'relative' in key_lower and 'name' in key_lower:
+                        clean_val = TranslitHelper.correct_marathi_ocr(clean_val)
                         additional_fields['relativeName'] = clean_val # Standard key
                         additional_fields['relativeNameEnglish'] = TranslitHelper.transliterate_marathi_to_english(clean_val)
                     elif 'gender' in key_lower:
-                         # Use TranslitHelper for mapping to English (Male/Female)
-                         # We already mapped clean_val to 'पु'/'स्री' above, but map_gender handles that too.
-                         additional_fields['gender'] = clean_val # Standard key
-                         additional_fields['genderEnglish'] = TranslitHelper.map_gender(clean_val)
+                         apply_gender_to_fields(additional_fields, clean_val)
                     elif 'age' in key_lower:
                         additional_fields['age'] = clean_val # Standard key
                     elif 'relation' in key_lower and 'type' in key_lower:
@@ -1109,6 +1247,12 @@ def _extract_cell_internal(page, page_num, cell_info, config, extraction_limits,
                         additional_fields['relativeNameEnglish'] = TranslitHelper.transliterate_marathi_to_english(additional_fields['relativeName'])
                         break
 
+        # Gender fallback: parse from full cell OCR when the gender box missed it
+        if not additional_fields.get('gender') and full_text:
+            gender_from_cell = extract_gender_from_text(full_text)
+            if gender_from_cell:
+                apply_gender_to_fields(additional_fields, gender_from_cell)
+
         # === AI SMART CORRECTION (DISABLED) ===
         # if 'name' in additional_fields and 'relativeName' in additional_fields:
         #     original_name = additional_fields['name']
@@ -1122,19 +1266,58 @@ def _extract_cell_internal(page, page_num, cell_info, config, extraction_limits,
         #         # Update English transliteration too
         #         additional_fields['nameEnglish'] = TranslitHelper.transliterate_marathi_to_english(corrected_name)
 
-        # Return result
+        # Skip only if the cell has no usable content after full extraction
+        has_meaningful_content = (
+            has_valid_voter_id
+            or has_photo
+            or bool(full_text and len(full_text.strip()) > 3)
+            or any(
+                additional_fields.get(k)
+                for k in (
+                    'name', 'relativeName', 'gender', 'age',
+                    'houseNo', 'serialNo', 'assemblyNo', 'partNo', 'schoolName', 'occupation'
+                )
+            )
+        )
+        if not has_meaningful_content:
+            try:
+                if master_cell_img is not None and is_cell_empty(master_cell_img, threshold=250):
+                    print(
+                        f"      ⏭️  SKIP Page {page_num+1}, Row {row+1}, Col {col+1}: "
+                        "empty cell after extraction"
+                    )
+                    return {'skipped': True, 'stats': cell_stats, 'reason': 'empty_after_extraction'}
+            except Exception:
+                pass
+
+        # Set voter ID value: use valid extracted ID if present, otherwise set "NA" (never generate fake IDs)
+        final_voter_id = voter_id_text.strip() if (has_valid_voter_id and voter_id_text and voter_id_text.strip()) else "NA"
+
+        # Ensure all Marathi text fields have proper logical Unicode order (e.g. ितरपाड -> तिरपाड)
+        # and remove null bytes / control characters
+        if full_text:
+            full_text = full_text.replace('\x00', '')
+            full_text = TranslitHelper.fix_marathi_visual_order(full_text)
+        for k, v in list(additional_fields.items()):
+            if isinstance(v, str) and not k.endswith('_image'):
+                v = v.replace('\x00', '')
+                if not k.endswith('English'):
+                    v = TranslitHelper.fix_marathi_visual_order(v)
+                additional_fields[k] = v
 
         result = {
             'page': page_num + 1,
             'column': col + 1,
             'row': row + 1,
-            'voterID': voter_id_text if voter_id_text else "",
+            'voterID': final_voter_id,
             'full_text': full_text,
             'image_base64': photo_base64,
             'nameEnglish': additional_fields.get('nameEnglish', ''),
             'relativeNameEnglish': additional_fields.get('relativeNameEnglish', ''),
             'genderEnglish': additional_fields.get('genderEnglish', ''),
             'relationTypeEnglish': TranslitHelper.transliterate_relation_type(additional_fields.get('relationType', '')),
+            'occupation': additional_fields.get('occupation', ''),
+            'occupationEnglish': additional_fields.get('occupationEnglish', ''),
             **additional_fields,  # MERGE DYNAMIC FIELDS
             'metadata': {
                 'voter_id_confidence': voter_id_confidence,
@@ -1645,7 +1828,7 @@ def process_single_page_worker(task_info):
             if OCR_400DPI_AVAILABLE:
                 from ocr_processor_400dpi import OCRProcessor400DPI
                 proc_ocr = OCRProcessor400DPI()
-                # Set language from config if provided
+                proc_ocr.set_quality_mode(config.get('performanceMode', 'balanced'))
                 target_lang = config.get('language', 'mr')
                 proc_ocr.set_ocr_language(target_lang)
                 processors['ocr'] = proc_ocr
@@ -1739,7 +1922,7 @@ def process_single_page_worker(task_info):
                             val = re.sub(r'[|:;!॥\-]', '', val).strip()
                         
                         val = ' '.join(val.split())
-                        
+                        val = TranslitHelper.fix_marathi_visual_order(val)
                         page_data[field_key] = val
                         
                         # Populate English variant
@@ -1841,12 +2024,14 @@ def process_single_page_worker(task_info):
                 
                 # Transliterate Cell Fields (copy existing logic)
                 try:
-                    name_marathi = result.get('name', '')
+                    name_marathi = TranslitHelper.fix_marathi_visual_order(result.get('name', ''))
                     if name_marathi:
+                        result['name'] = name_marathi
                         result['nameEnglish'] = TranslitHelper.transliterate_marathi_to_english(name_marathi)
                     
-                    rel_name_marathi = result.get('relativeName', '')
+                    rel_name_marathi = TranslitHelper.fix_marathi_visual_order(result.get('relativeName', ''))
                     if rel_name_marathi:
+                        result['relativeName'] = rel_name_marathi
                         result['relativeNameEnglish'] = TranslitHelper.transliterate_marathi_to_english(rel_name_marathi)
                 except:
                     pass
@@ -2139,7 +2324,7 @@ def process_page(pdf_path, page_num, config, template, box_detector_config=None)
                             val = re.sub(r'[|:;!॥\--]', '', val).strip()
                             
                         val = ' '.join(val.split())
-                        
+                        val = TranslitHelper.fix_marathi_visual_order(val)
                         page_data[field_key] = val
                         
                         if val:
@@ -2221,12 +2406,14 @@ def process_page(pdf_path, page_num, config, template, box_detector_config=None)
                     result[pk] = pv
                 
                 try:
-                    name_marathi = result.get('name', '')
+                    name_marathi = TranslitHelper.fix_marathi_visual_order(result.get('name', ''))
                     if name_marathi:
+                        result['name'] = name_marathi
                         result['nameEnglish'] = TranslitHelper.transliterate_marathi_to_english(name_marathi)
                     
-                    rel_name_marathi = result.get('relativeName', '')
+                    rel_name_marathi = TranslitHelper.fix_marathi_visual_order(result.get('relativeName', ''))
                     if rel_name_marathi:
+                        result['relativeName'] = rel_name_marathi
                         result['relativeNameEnglish'] = TranslitHelper.transliterate_marathi_to_english(rel_name_marathi)
                 except:
                     pass
@@ -2361,6 +2548,17 @@ def extract_grid_vertical_enhanced(pdf_bytes, config, pdf_path=None):
             if i % batch_size == 0 and i > 0:
                 gc.collect()
         
+        # Final sanitization of all extracted data fields to fix any visual-order Marathi text (e.g. ितरपाड -> तिरपाड)
+        # and strip null bytes / illegal characters
+        for rec in extracted_data:
+            for k, v in list(rec.items()):
+                if isinstance(v, str):
+                    if '\x00' in v:
+                        v = v.replace('\x00', '')
+                    if '\u093F' in v:
+                        v = TranslitHelper.fix_marathi_visual_order(v)
+                    rec[k] = v
+
         # Sort results by Serial No primarily, fallback to physical order
         def get_sort_key(x):
             s = x.get('serialNo')

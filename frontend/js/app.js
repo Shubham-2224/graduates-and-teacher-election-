@@ -550,7 +550,7 @@ function handlePreview() {
 
     // Populate stats
     const totalRecords = AppState.extractedData.length;
-    const withVoterIds = AppState.extractedData.filter(r => r.voterID && r.voterID.trim()).length;
+    const withVoterIds = AppState.extractedData.filter(r => r.voterID && r.voterID.trim() && r.voterID.toUpperCase() !== 'NA').length;
     const withPhotos = AppState.extractedData.filter(r => r.image_base64 && r.image_base64.trim()).length;
 
     elements.previewStats.innerHTML = `
@@ -583,7 +583,7 @@ function handlePreview() {
                 <td>${record.prabhag || '-'}</td>
                 <td>${record.boothNo || '-'}</td>
                 <td>${record.serialNo || '-'}</td>
-                <td class="voter-id-cell">${record.voterID || '<span class="no-data">No ID</span>'}</td>
+                <td class="voter-id-cell">${(record.voterID && record.voterID.trim()) ? record.voterID : 'NA'}</td>
                 <td>${record.name || '-'}</td>
                 <td>${record.nameEnglish || '-'}</td>
                 <td>${record.relationType || '-'}</td>
@@ -593,6 +593,9 @@ function handlePreview() {
                 <td>${record.gender || '-'}</td>
                 <td>${record.age || '-'}</td>
                 <td>${record.assemblyNo || '-'}</td>
+                <td>${record.schoolName || record.schoolNameEnglish || '-'}</td>
+                <td>${record.occupation || '-'}</td>
+                <td>${record.occupationEnglish || '-'}</td>
                 <td>${record.boothCenter || '-'}</td>
                 <td>${record.boothCenterEnglish || '-'}</td>
                 <td>${record.boothAddress || '-'}</td>

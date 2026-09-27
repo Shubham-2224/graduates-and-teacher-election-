@@ -12,10 +12,11 @@ from PIL import Image, ImageEnhance, ImageFilter
 from typing import Dict, List, Optional, Tuple
 
 try:
-    from paddle_ocr_processor import PaddleOCRProcessor
-    PADDLE_PROCESSOR_AVAILABLE = True
+    from paddle_ocr_processor import PaddleOCRProcessor, PADDLE_AVAILABLE
+    PADDLE_PROCESSOR_AVAILABLE = PADDLE_AVAILABLE
 except ImportError:
     PADDLE_PROCESSOR_AVAILABLE = False
+    PADDLE_AVAILABLE = False
     # print("WARNING: PaddleOCR Processor module not found")
 
 try:
@@ -37,16 +38,84 @@ class OCRProcessor400DPI:
     CONFIG_AGE_GENDER = "--psm 7 -c tessedit_char_whitelist=0123456789MF --oem 3"
     CONFIG_NAME = "--psm 6 --oem 3" # Standard block
 
+    # Cached Tesseract language packs (probed once per process)
+    _tesseract_lang_cache = None
+
+    @classmethod
+    def _probe_tesseract_lang(cls, lang: str) -> bool:
+        """Return True if Tesseract can load this language pack."""
+        try:
+            pytesseract.image_to_string(
+                Image.new('RGB', (12, 12), color='white'),
+                lang=lang,
+                config='--psm 6 --oem 1',
+            )
+            return True
+        except Exception:
+            return False
+
+    @classmethod
+    def _detect_tesseract_lang_packs(cls) -> dict:
+        """
+        Detect installed Tesseract language packs.
+        get_languages() often omits script/* packs, so we probe known codes.
+        """
+        if cls._tesseract_lang_cache is not None:
+            return cls._tesseract_lang_cache
+
+        reported = set(pytesseract.get_languages(config=''))
+        packs = {
+            'eng': 'eng' in reported or cls._probe_tesseract_lang('eng'),
+            'mar': cls._probe_tesseract_lang('mar'),
+            'hin': cls._probe_tesseract_lang('hin'),
+            'devanagari': cls._probe_tesseract_lang('script/Devanagari'),
+        }
+        cls._tesseract_lang_cache = packs
+        return packs
+
+    @classmethod
+    def resolve_tesseract_langs(cls, force_marathi: bool = False) -> str:
+        """
+        Build a Tesseract lang string that works on this machine.
+        Using bare 'mar' alone fails when mar.traindata is missing (common on Windows).
+        """
+        packs = cls._detect_tesseract_lang_packs()
+        parts = []
+
+        if force_marathi:
+            if packs.get('mar'):
+                parts.append('mar')
+            elif packs.get('hin'):
+                parts.append('hin')
+            elif packs.get('devanagari'):
+                parts.append('script/Devanagari')
+            if packs.get('eng'):
+                parts.append('eng')
+        else:
+            if packs.get('mar'):
+                parts.append('mar')
+            if packs.get('hin'):
+                parts.append('hin')
+            if packs.get('devanagari') and 'script/Devanagari' not in parts:
+                parts.append('script/Devanagari')
+            if packs.get('eng'):
+                parts.append('eng')
+
+        if not parts:
+            return 'eng'
+        return '+'.join(parts)
+
     def __init__(self):
         """Initialize OCR processor"""
         # PERFORMANCE OPTIMIZATION: Use configurable DPI with default for speed
         self.dpi = int(os.getenv('OCR_DPI', '150'))  # Default to 150 DPI for faster processing
         self.current_lang = 'mr' # Default to Marathi
-        self.quality_mode = os.getenv('OCR_QUALITY', 'fast')  # fast, balanced, accurate
+        self.quality_mode = os.getenv('OCR_QUALITY', 'balanced')  # fast, balanced, accurate
 
         # Performance optimization: Cache for processed images
         self.image_cache = {}
         self.cache_max_size = 50  # Limit cache size to prevent memory issues
+        self.paddle_processor = None
 
         # Configure Tesseract path from environment (critical for systemd services)
         tesseract_cmd = os.getenv('TESSERACT_CMD')
@@ -54,6 +123,14 @@ class OCRProcessor400DPI:
             pytesseract.pytesseract.tesseract_cmd = tesseract_cmd
         elif os.name != 'nt':  # Linux/Unix - ensure tesseract is findable
             for path in ['/usr/bin/tesseract', '/usr/local/bin/tesseract']:
+                if os.path.exists(path):
+                    pytesseract.pytesseract.tesseract_cmd = path
+                    break
+        elif os.name == 'nt':
+            for path in [
+                r'C:\Program Files\Tesseract-OCR\tesseract.exe',
+                r'C:\Program Files (x86)\Tesseract-OCR\tesseract.exe',
+            ]:
                 if os.path.exists(path):
                     pytesseract.pytesseract.tesseract_cmd = path
                     break
@@ -83,6 +160,28 @@ class OCRProcessor400DPI:
             self.enable_char_processing = True  # Only for accurate
             self.enable_paddle_fallback = True
 
+        self._init_paddle_processor()
+
+        packs = self._detect_tesseract_lang_packs()
+        if not packs.get('mar') and not packs.get('devanagari'):
+            print(
+                "WARNING: Marathi Tesseract pack not found; using fallback: "
+                f"{self.resolve_tesseract_langs(force_marathi=True)}"
+            )
+
+    def _init_paddle_processor(self):
+        """Lazy-init PaddleOCR when quality mode allows it."""
+        if not PADDLE_PROCESSOR_AVAILABLE or not self.enable_paddle_fallback:
+            self.paddle_processor = None
+            return
+        if self.paddle_processor is not None:
+            return
+        try:
+            self.paddle_processor = PaddleOCRProcessor(lang='mr')
+        except Exception as e:
+            print(f"Failed to init PaddleOCR: {e}")
+            self.paddle_processor = None
+
     def set_quality_mode(self, mode: str):
         """Update quality mode and related flags"""
         self.quality_mode = mode
@@ -91,30 +190,22 @@ class OCRProcessor400DPI:
             self.min_confidence_threshold = 0.6
             self.enable_char_processing = False
             self.enable_paddle_fallback = False
-            self.dpi = 200 # Faster DPI for fast mode
+            self.dpi = 200  # Faster DPI for fast mode
+            self.paddle_processor = None
         elif mode == 'balanced':
             self.max_retries = 2
             self.min_confidence_threshold = 0.4
             self.enable_char_processing = False
             self.enable_paddle_fallback = True
             self.dpi = 300
+            self._init_paddle_processor()
         else:
             self.max_retries = 3
             self.min_confidence_threshold = 0.3
             self.enable_char_processing = True
             self.enable_paddle_fallback = True
             self.dpi = 300
-
-
-        print("OK: OCR Processor initialized with 300 DPI (EPIC-optimized)")
-
-        # Initialize PaddleOCR if available
-        self.paddle_processor = None
-        if PADDLE_PROCESSOR_AVAILABLE:
-            try:
-                self.paddle_processor = PaddleOCRProcessor(lang='mr')
-            except Exception as e:
-                print(f"Failed to init PaddleOCR: {e}")
+            self._init_paddle_processor()
 
     def test_epic_extraction(self, test_images: list = None) -> None:
         """
@@ -175,7 +266,7 @@ class OCRProcessor400DPI:
              self.paddle_processor.set_language(standard_lang)
              self.current_lang = standard_lang
 
-    def extract_text_with_config(self, image: Image.Image, config: str) -> str:
+    def extract_text_with_config(self, image: Image.Image, config: str, force_marathi: bool = False) -> str:
         """
         Extract text using a specific Tesseract configuration.
         Fast path for specific fields (EPIC, Age, etc).
@@ -183,7 +274,8 @@ class OCRProcessor400DPI:
         try:
              # Preprocess
             processed_img = self.preprocess_image(image, for_ocr=True)
-            return pytesseract.image_to_string(processed_img, config=config, lang='eng+hin').strip()
+            langs = self.resolve_tesseract_langs(force_marathi=force_marathi)
+            return pytesseract.image_to_string(processed_img, config=config, lang=langs).strip()
         except Exception as e:
             print(f"      OCRError: {e}")
             return ""
@@ -645,30 +737,38 @@ class OCRProcessor400DPI:
         if not text:
             return None
 
-        # Clean the text
-        text = text.upper().strip()
-        text = re.sub(r'[^\w\s]', '', text)  # Remove punctuation
+        if not text:
+            return None
 
-        # Try different patterns
-        patterns = [
-            r'\b([A-Z]{3}[0-9]{7})\b',           # ABC1234567
-            r'\b([A-Z]{3}\s*[0-9]{7})\b',        # ABC 1234567
-            r'\b([A-Z]{2,4}[0-9]{6,8})\b',       # Flexible
-        ]
+        clean_upper = text.upper().strip()
 
-        for pattern in patterns:
-            matches = re.findall(pattern, text)
-            if matches:
-                epic = matches[0].replace(' ', '')
+        # 1. State EPIC format (e.g., MH/12/034/123456, MT/01/123/123456)
+        state_match = re.search(r'\b([A-Z]{2,3}/[0-9]{1,3}/[0-9]{1,3}/[0-9]{1,7})\b', clean_upper)
+        if state_match:
+            return {'epic': state_match.group(1), 'confidence': 1.0}
 
-                # Calculate confidence based on format compliance
-                confidence = self._calculate_epic_confidence(epic)
+        # 2. Standard EPIC format (3 letters + 7 digits) e.g., ABC1234567 or ABC 1234567 or ABC-1234567
+        std_match = re.search(r'\b([A-Z]{3})[\s\-\.]*([0-9]{7})\b', clean_upper)
+        if std_match:
+            epic = f"{std_match.group(1)}{std_match.group(2)}"
+            return {'epic': epic, 'confidence': 1.0}
 
-                if confidence > 0.5:  # Minimum confidence threshold
-                    return {
-                        'epic': epic,
-                        'confidence': confidence
-                    }
+        # 3. Flexible EPIC format (2-4 letters + 6-8 digits) e.g., WRN0123456
+        flex_match = re.search(r'\b([A-Z]{2,4})[\s\-\.]*([0-9]{6,8})\b', clean_upper)
+        if flex_match:
+            epic = f"{flex_match.group(1)}{flex_match.group(2)}"
+            return {'epic': epic, 'confidence': 0.9}
+
+        # 4. Near-match where prefix has single digit typo e.g., 0BC1234567 -> OBC1234567
+        # ONLY if clean alphanumeric length is 10 and last 7 are digits
+        alpha_num = re.sub(r'[^A-Z0-9]', '', clean_upper)
+        if len(alpha_num) == 10 and alpha_num[3:].isdigit():
+            prefix = list(alpha_num[:3])
+            digit_map = {'0': 'O', '1': 'I', '2': 'Z', '5': 'S', '8': 'B', '6': 'G', '4': 'A'}
+            fixed_prefix = [digit_map.get(c, c) for c in prefix]
+            if all(c.isalpha() for c in fixed_prefix):
+                epic = "".join(fixed_prefix) + alpha_num[3:]
+                return {'epic': epic, 'confidence': 0.85}
 
         return None
 
@@ -782,156 +882,22 @@ class OCRProcessor400DPI:
 
     def _correct_voter_id_format(self, voter_id: str) -> str:
         """
-        Correct Voter ID format using minimal corrections for EPIC format (ABC1234567):
-        - Positions 1-3: Should be LETTERS (A-Z) - minimal corrections only for obvious OCR errors
-        - Positions 4-10: Should be NUMBERS (0-9) - correct common letter/number confusions
-
-        Args:
-            voter_id: Raw voter ID from OCR
-
-        Returns:
-            Corrected voter ID
+        Validates and cleans Voter ID format.
+        Returns clean valid EPIC (or State format) if found, otherwise returns "".
+        Never forces fake letters/digits onto random text or numbers.
         """
-        # STRICT 10-character check (3 letters + 7 digits)
         if not voter_id:
             return ""
-        
-        # Clean anything that's not alphanumeric
-        voter_id = re.sub(r'[^A-Z0-9]', '', voter_id.upper())
-        
-        if len(voter_id) < 8:
-            return voter_id
 
-        original = voter_id
+        voter_id_clean = voter_id.upper().strip()
 
-        # COMPREHENSIVE letter corrections (for positions 1-3) - convert numbers that look like letters
-        # Based on common OCR confusions in Indian documents
-        letter_corrections = {
-            '0': 'O',  # 0 can look like O
-            '1': 'I',  # 1 can look like I (most common)
-            '2': 'Z',  # 2 can look like Z
-            '3': 'E',  # 3 can look like E
-            '4': 'A',  # 4 can look like A
-            '5': 'S',  # 5 can look like S
-            '6': 'G',  # 6 can look like G/C
-            '7': 'T',  # 7 can look like T
-            '8': 'B',  # 8 can look like B
-            '9': 'G',  # 9 can look like G
-        }
+        # Check if text contains a genuine EPIC pattern
+        match = self._validate_epic_format(voter_id_clean)
+        if match and match.get('epic'):
+            return match['epic']
 
-        # EXTENDED corrections for additional common confusions
-        # Add multiple possible mappings for ambiguous digits
-        extended_letter_corrections = {
-            '0': ['O'],      # 0 -> O
-            '1': ['I', 'L'], # 1 -> I or L
-            '2': ['Z'],      # 2 -> Z
-            '3': ['E'],      # 3 -> E
-            '4': ['A'],      # 4 -> A
-            '5': ['S'],      # 5 -> S
-            '6': ['G', 'C'], # 6 -> G or C
-            '7': ['T'],      # 7 -> T
-            '8': ['B'],      # 8 -> B
-            '9': ['G', 'Q'], # 9 -> G or Q
-        }
-
-        # Number correction map (for positions 4-10) - letters that commonly look like numbers
-        number_corrections = {
-            'O': '0',
-            'I': '1',
-            'L': '1',
-            'Z': '2',
-            'E': '3',
-            'A': '4',
-            'S': '5',
-            'G': '6',
-            'T': '7',
-            'B': '8',
-            'Q': '0',
-            'D': '0',
-        }
-
-        corrected = list(voter_id.upper())  # Ensure uppercase
-        corrections_made = []
-
-        # Phase 1: Ensure first 3 positions are LETTERS (COMPREHENSIVE APPROACH)
-        for i in range(min(3, len(corrected))):
-            char = corrected[i]
-            # Convert digits to the most likely letters
-            if char.isdigit():
-                possible_letters = extended_letter_corrections.get(char, [])
-                if possible_letters:
-                    # Use the first (most likely) option
-                    new_char = possible_letters[0]
-                    if new_char != char:
-                        corrections_made.append(f"Pos {i+1}: '{char}' → '{new_char}' (letter)")
-                        corrected[i] = new_char
-                else:
-                    # Fallback for unmapped digits
-                    corrections_made.append(f"Pos {i+1}: '{char}' → 'X' (unknown digit)")
-                    corrected[i] = 'X'
-
-        # Phase 2: Ensure positions 4-10 are NUMBERS
-        for i in range(3, min(10, len(corrected))):
-            char = corrected[i]
-            # Convert letters to the most likely numbers
-            if char.isalpha():
-                new_char = number_corrections.get(char, '0')  # Use 0 as fallback
-                if new_char != char:
-                    corrections_made.append(f"Pos {i+1}: '{char}' → '{new_char}' (number)")
-                    corrected[i] = new_char
-
-        result = ''.join(corrected)
-
-        # ADVANCED CORRECTION: If result doesn't match EPIC format, try alternative corrections
-        if len(result) >= 10 and not (result[:3].isalpha() and result[3:10].isdigit()):
-            # Try alternative corrections for ambiguous digits
-            alternative_results = [result]  # Start with current result
-
-            # Generate alternatives for positions with multiple possible corrections
-            original_chars = list(voter_id.upper())
-            for i in range(min(3, len(original_chars))):
-                if original_chars[i].isdigit():
-                    possible_letters = extended_letter_corrections.get(original_chars[i], [])
-                    if len(possible_letters) > 1:  # Multiple possibilities
-                        # Create alternative results with different letter choices
-                        new_alternatives = []
-                        for alt_result in alternative_results:
-                            alt_list = list(alt_result)
-                            for letter_option in possible_letters:
-                                alt_list[i] = letter_option
-                                new_alt = ''.join(alt_list)
-                                if new_alt not in new_alternatives:
-                                    new_alternatives.append(new_alt)
-                        alternative_results.extend(new_alternatives)
-
-            # Find the best alternative that matches EPIC format
-            for alt_result in alternative_results[1:]:  # Skip original
-                if len(alt_result) >= 10 and alt_result[:3].isalpha() and alt_result[3:10].isdigit():
-                    result = alt_result
-                    corrections_made.append(f"Applied alternative correction: {alt_result}")
-                    break
-
-        # Final validation: Ensure EPIC format (3 letters + 7 digits)
-        if len(result) >= 10:
-            # Force correct format if validation fails
-            if not (result[:3].isalpha() and result[3:10].isdigit()):
-                validated_result = ''
-                for i, char in enumerate(result[:10]):
-                    if i < 3:  # First 3 must be letters
-                        validated_result += char if char.isalpha() else 'X'
-                    else:  # Last 7 must be digits
-                        validated_result += char if char.isdigit() else '0'
-                result = validated_result
-                corrections_made.append("Applied EPIC format validation")
-
-        # Log corrections if any were made (reduced verbosity)
-        if corrections_made and len(corrections_made) <= 5:  # Only log if reasonable number of corrections
-            print(f"      🔧 Voter ID corrections ({len(corrections_made)}): '{original}' → '{result}'")
-            if len(corrections_made) <= 3:
-                for correction in corrections_made:
-                    print(f"         - {correction}")
-
-        return result
+        # If not a genuine EPIC, return empty string (will output as "NA")
+        return ""
 
     
     def _extract_voter_id_from_text(self, text: str) -> Tuple[str, float]:
@@ -1066,6 +1032,7 @@ class OCRProcessor400DPI:
                              pdf_page=None, 
                              rect=None,
                              force_marathi=False,
+                             force_english=False,
                              fast_preprocess=False) -> Dict:
         """
         Extract text from a cell.
@@ -1090,39 +1057,86 @@ class OCRProcessor400DPI:
             
             text = ""
             method = "none"
+            ocr_source = image if image is not None else processed_img
 
-            # STRATEGY 1: PaddleOCR (Best for Marathi)
-            # Skip PaddleOCR in 'fast' mode for maximum speed
-            if self.paddle_processor and self.quality_mode != 'fast':
-                try:
-                    # If forcing Marathi, ensure we use Marathi model logic primarily
-                    # Reduced logging for speed
-                    text = self.paddle_processor.get_full_text(image, separator="\n")
+            # STRATEGY FOR ENGLISH FIELDS (e.g., School Name)
+            if force_english:
+                tess_config = '--psm 6 --oem 1'
+                for img_variant, variant_label in (
+                    (ocr_source, 'original'),
+                    (processed_img, 'processed'),
+                ):
                     if text.strip():
-                        method = 'paddle_mar'
-                except Exception as e:
-                    pass
+                        break
+                    try:
+                        text = pytesseract.image_to_string(
+                            img_variant,
+                            lang='eng',
+                            config=tess_config,
+                        ).strip()
+                        if text.strip():
+                            method = f'tesseract_eng_{variant_label}'
+                    except Exception:
+                        continue
+                if not text.strip() and self.paddle_processor and getattr(self.paddle_processor, 'ocr', None):
+                    try:
+                        text = self.paddle_processor.get_full_text(ocr_source, separator="\n")
+                        if text.strip():
+                            method = 'paddle'
+                    except Exception:
+                        pass
+            else:
+                # STRATEGY 1: PaddleOCR (Best for Marathi)
+                if (
+                    self.paddle_processor
+                    and self.enable_paddle_fallback
+                    and getattr(self.paddle_processor, 'ocr', None)
+                ):
+                    try:
+                        text = self.paddle_processor.get_full_text(ocr_source, separator="\n")
+                        if text.strip():
+                            method = 'paddle_mar'
+                    except Exception:
+                        pass
 
-            # STRATEGY 2: Tesseract Fallback (Primary in 'fast' mode)
-            if not text.strip():
-                try:
-                    # If enforcing Marathi, ONLY use Marathi language data to avoid English confusion
-                    langs = 'mar' if force_marathi else 'mar+hin+eng'
-                    
-                    # Performance optimization: cache result of get_languages
-                    # For simplicity, we assume 'mar' is available or fallback is handled by pytesseract
-                    
-                    text = pytesseract.image_to_string(
-                        processed_img,
-                        lang=langs,
-                        config='--psm 6 --oem 1' # OEM 1 is usually faster Neural net mode
-                    ).strip()
-                    method = 'tesseract_fallback'
-                except Exception as e:
-                    pass
+                # STRATEGY 2: Tesseract (always available fallback)
+                if not text.strip():
+                    langs = self.resolve_tesseract_langs(force_marathi=force_marathi)
+                    tess_config = '--psm 6 --oem 1'
+
+                    for img_variant, variant_label in (
+                        (processed_img, 'processed'),
+                        (ocr_source, 'original'),
+                    ):
+                        if text.strip():
+                            break
+                        try:
+                            text = pytesseract.image_to_string(
+                                img_variant,
+                                lang=langs,
+                                config=tess_config,
+                            ).strip()
+                            if text.strip():
+                                method = f'tesseract_{variant_label}'
+                        except Exception:
+                            continue
+
+                    # Last resort: English-only (EPIC/house numbers) when Marathi packs missing
+                    if not text.strip() and not force_marathi:
+                        try:
+                            text = pytesseract.image_to_string(
+                                ocr_source,
+                                lang='eng',
+                                config=tess_config,
+                            ).strip()
+                            if text.strip():
+                                method = 'tesseract_eng'
+                        except Exception:
+                            pass
             
             # Post-Processing / Reconstruction
-            final_text = self._post_process_marathi_text(text, remove_english=force_marathi)
+            remove_english = force_marathi and not force_english
+            final_text = self._post_process_marathi_text(text, remove_english=remove_english)
 
             return {
                 'text': final_text,

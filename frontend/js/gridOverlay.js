@@ -15,6 +15,8 @@ class GridOverlay {
         serialNo: { label: 'Serial No', key: 's', color: '#6366f1' },    // Indigo
         assemblyNo: { label: 'Assembly No', key: 'm', color: '#14b8a6' }, // Teal
         relationType: { label: 'Relation Type', key: 't', color: '#10b981' }, // Emerald
+        schoolName: { label: 'School Name', key: 'l', color: '#0284c7' }, // Sky Blue (English)
+        occupation: { label: 'Occupation', key: 'o', color: '#f97316' }, // Orange
         boothCenter: { label: 'Booth Center', key: 'c', color: '#db2777', scope: 'page' }, // Pink-Red
         boothAddress: { label: 'Booth Address', key: 'b', color: '#7c3aed', scope: 'page' } // Violet
     };
@@ -587,7 +589,7 @@ class GridOverlay {
      * to be scaled because they're drawn on the canvas at pdfScale.
      */
     getCellTemplate() {
-        if (!this.boxes.voterID) { // Minimum requirement
+        if (Object.keys(this.boxes).length === 0) { // Minimum requirement: at least one box defined
             return null;
         }
 
@@ -1249,6 +1251,8 @@ class GridOverlay {
             // Mapping based on standard expectations from getCellTemplate
             if (config.cellTemplate.voterIdBox) this.boxes['voterID'] = config.cellTemplate.voterIdBox;
             if (config.cellTemplate.photoBox) this.boxes['photo'] = config.cellTemplate.photoBox;
+            if (config.cellTemplate.occupation) this.boxes['occupation'] = config.cellTemplate.occupation;
+            if (config.cellTemplate.occupationBox) this.boxes['occupation'] = config.cellTemplate.occupationBox;
 
             if (config.cellTemplate.fields) {
                 for (const [key, box] of Object.entries(config.cellTemplate.fields)) {

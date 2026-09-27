@@ -5,8 +5,34 @@ Excel Generator - Create Excel files with extracted voter data
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Border, Side, Alignment
 from openpyxl.utils import get_column_letter
+from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
 import os
+import re
+import sys
 from typing import List, Dict
+
+# Ensure console does not crash on non-ASCII characters in Windows
+if hasattr(sys.stdout, 'reconfigure'):
+    try:
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+        sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:
+        pass
+
+try:
+    from translit_helper import TranslitHelper
+except ImportError:
+    TranslitHelper = None
+
+
+def clean_for_excel(val):
+    """Remove null bytes and illegal XML characters that crash openpyxl"""
+    if not isinstance(val, str):
+        return val
+    val = ILLEGAL_CHARACTERS_RE.sub('', val)
+    val = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x84\x86-\x9f\ufffe\uffff]', '', val)
+    return val
+
 
 
 def generate_excel(data: List[Dict], output_path: str) -> bool:
@@ -26,16 +52,6 @@ def generate_excel(data: List[Dict], output_path: str) -> bool:
         worksheet = workbook.active
         worksheet.title = 'Voter Data'
         
-        # Determine all image columns
-        include_main_image = any(record.get('image_base64') for record in data)
-        additional_image_keys = set()
-        for record in data:
-            for key in record.keys():
-                if key.endswith('_image'):
-                    additional_image_keys.add(key)
-        
-        sorted_image_keys = sorted(list(additional_image_keys))
-        
         # Define base headers
         headers = [
             'Serial No', 
@@ -46,18 +62,12 @@ def generate_excel(data: List[Dict], output_path: str) -> bool:
             'House No', 
             'Gender', 
             'Age', 'Assembly No',
+            'School Name',
+            'Occupation', 'Occupation (English)',
             'Booth Center', 'Booth Center (English)',
             'Booth Address', 'Booth Address (English)',
             'Prabhag', 'Booth No'
         ]
-        
-        if include_main_image:
-            headers.append('Base64 Image String')
-        
-        for key in sorted_image_keys:
-            # Format header name
-            header_name = key.replace('_', ' ').title()
-            headers.append(header_name)
         
         # Apply styling to headers
         header_font = Font(bold=True, size=12, color='FFFFFFFF')
@@ -67,19 +77,18 @@ def generate_excel(data: List[Dict], output_path: str) -> bool:
         worksheet.append(headers) 
   
         # Style header row and set column widths
+        standard_widths = [10, 15, 25, 25, 15, 25, 25, 10, 8, 8, 12, 30, 20, 20, 30, 30, 30, 30, 15, 15]
         for col_num in range(1, len(headers) + 1):
             cell = worksheet.cell(row=1, column=col_num)
             cell.font = header_font
             cell.fill = header_fill
             cell.alignment = header_alignment
             
-            # Set default widths for standard columns, then auto for images
             col_letter = get_column_letter(col_num)
-            if col_num <= 17:
-                standard_widths = [10, 15, 25, 25, 15, 25, 25, 10, 8, 8, 12, 30, 30, 30, 30, 15, 15]
+            if col_num <= len(standard_widths):
                 worksheet.column_dimensions[col_letter].width = standard_widths[col_num-1]
             else:
-                worksheet.column_dimensions[col_letter].width = 25 # Image B64 columns
+                worksheet.column_dimensions[col_letter].width = 25
         
         # Define border style
         thin_border = Border(
@@ -109,7 +118,7 @@ def generate_excel(data: List[Dict], output_path: str) -> bool:
             # Prepare row values in order
             row_values = [
                 record.get('serialNo') or record.get('Serial No') or record.get('serial_no') or '',
-                record.get('voterID', ''),
+                record.get('voterID') or 'NA',
                 record.get('name', ''),
                 record.get('nameEnglish', ''),
                 record.get('relationType', ''),
@@ -119,6 +128,9 @@ def generate_excel(data: List[Dict], output_path: str) -> bool:
                 record.get('gender', ''),
                 record.get('age', ''),
                 record.get('assemblyNo', ''),
+                record.get('schoolName') or record.get('School Name') or record.get('school_name') or '',
+                record.get('occupation') or record.get('Occupation') or record.get('occupations') or '',
+                record.get('occupationEnglish') or record.get('Occupation (English)') or record.get('occupation_english') or record.get('Occupations (English)') or '',
                 record.get('boothCenter', ''),
                 record.get('boothCenterEnglish', ''),
                 record.get('boothAddress', ''),
@@ -126,12 +138,17 @@ def generate_excel(data: List[Dict], output_path: str) -> bool:
                 record.get('prabhag', ''),
                 record.get('boothNo', '')
             ]
-
-            if include_main_image:
-                row_values.append(record.get('image_base64', ''))
             
-            for key in sorted_image_keys:
-                row_values.append(record.get(key, ''))
+            # Sanitize illegal XML characters and normalize Marathi visual order (e.g. ितरपाड -> तिरपाड)
+            cleaned_row_values = []
+            for val in row_values:
+                if isinstance(val, str):
+                    val = clean_for_excel(val)
+                    if TranslitHelper and '\u093F' in val:
+                        val = TranslitHelper.fix_marathi_visual_order(val)
+                    val = clean_for_excel(val)
+                cleaned_row_values.append(val)
+            row_values = cleaned_row_values
             
             # Write row
             worksheet.append(row_values)
@@ -155,6 +172,7 @@ def generate_excel(data: List[Dict], output_path: str) -> bool:
         return True
     
     except Exception as e:
-        print(f"Excel generation error: {str(e)}")
+        safe_msg = str(e).encode('ascii', errors='backslashreplace').decode('ascii')
+        print(f"Excel generation error: {safe_msg}")
         raise
 

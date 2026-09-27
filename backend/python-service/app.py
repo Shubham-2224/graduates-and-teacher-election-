@@ -2,9 +2,18 @@ from flask import Flask, request, jsonify, send_file
 from flask.helpers import send_from_directory
 from flask_cors import CORS
 import os
+import sys
 import json
 import traceback
 import logging
+
+# Ensure Windows console encoding does not crash on Marathi or non-ASCII characters
+if hasattr(sys.stdout, 'reconfigure'):
+    try:
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+        sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:
+        pass
 import shutil
 import threading
 import time
@@ -1057,7 +1066,7 @@ if __name__ == '__main__':
     # Suppress Flask startup messages for cleaner output
     import sys
     if not DEBUG_MODE:
-        sys.stdout = open('flask_startup.log', 'w')
-        sys.stderr = open('flask_startup.log', 'w')
+        sys.stdout = open('flask_startup.log', 'w', encoding='utf-8', errors='replace')
+        sys.stderr = open('flask_startup.log', 'w', encoding='utf-8', errors='replace')
     
     app.run(host='0.0.0.0', port=5000, debug=DEBUG_MODE, threaded=True)

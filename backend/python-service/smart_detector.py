@@ -116,31 +116,31 @@ class SmartDetector:
     
     def _extract_voter_id_patterns(self, text: str) -> List[str]:
         """
-        Extract voter ID patterns from text
-        
-        Common formats:
-        - ABC1234567 (3 letters + 7 digits)
-        - 10+ alphanumeric characters
+        Extract genuine voter ID patterns from text
+        Formats:
+        - Old State Format: MH/12/034/123456
+        - Standard: ABC1234567 (3 letters + 7 digits)
+        - Flexible: 2-4 letters + 6-8 digits
         """
-        # Clean text
-        text = text.upper().replace(' ', '').replace('\n', '')
-        
-        # Find all potential voter IDs
+        if not text:
+            return []
+
+        clean_upper = text.upper().strip()
         candidates = []
         
-        # Pattern 1: ABC1234567 format
-        matches = re.findall(r'[A-Z]{3}[0-9]{7}', text)
-        candidates.extend(matches)
+        # 1. State format e.g. MH/12/034/123456
+        state_matches = re.findall(r'\b[A-Z]{2,3}/[0-9]{1,3}/[0-9]{1,3}/[0-9]{1,7}\b', clean_upper)
+        candidates.extend(state_matches)
         
-        # Pattern 2: Long alphanumeric (10+ chars)
-        if not candidates:
-            matches = re.findall(r'[A-Z0-9]{10,}', text)
-            candidates.extend(matches)
+        # 2. Standard ABC1234567 format
+        no_space = clean_upper.replace(' ', '')
+        std_matches = re.findall(r'\b[A-Z]{3}[0-9]{7}\b', no_space)
+        candidates.extend(std_matches)
         
-        # Pattern 3: Any sequence with both letters and numbers
+        # 3. Flexible format: 2-4 letters + 6-8 digits
         if not candidates:
-            matches = re.findall(r'(?=.*[A-Z])(?=.*[0-9])[A-Z0-9]{8,}', text)
-            candidates.extend(matches)
+            flex_matches = re.findall(r'\b[A-Z]{2,4}[0-9]{6,8}\b', no_space)
+            candidates.extend(flex_matches)
         
         return candidates
     

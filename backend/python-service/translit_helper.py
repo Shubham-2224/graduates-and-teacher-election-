@@ -35,6 +35,42 @@ class TranslitHelper:
         'माटेवाचि': 'माटेवाडी',
         'वाची': 'वाडी',
         'वाचि': 'वाडी',
+        'ितरपाड': 'तिरपाड',
+        'पिरषद': 'परिषद',
+        'िवधान': 'विधान',
+        'िवद्यालय': 'विद्यालय',
+        'किवता': 'कविता',
+        'सिवता': 'सविता',
+        'सिचन': 'सचिन',
+        'मिहला': 'महिला',
+        'सिरता': 'सरिता',
+        'सुिनता': 'सुनिता',
+        'हिरभाऊ': 'हरिभाऊ',
+        'प्राथिमक': 'प्राथमिक',
+        'माध्यिमक': 'माध्यमिक',
+        'मध्यिमक': 'मध्यमिक',
+        'उदिगरे': 'उदगिरे',
+        'कुंडिलक': 'कुंडलिक',
+        'जयिसंग': 'जयसिंग',
+        'तुळिशराम': 'तुळशिराम',
+        'प्रितक': 'प्रतिक',
+        'प्रितश': 'प्रतिश',
+        'प्रिसद्धीचा': 'प्रसिद्धीचा',
+        'बाळिक्रष्ण': 'बाळकृष्ण',
+        'बाळिशराम': 'बाळशिराम',
+        'भालिचम': 'भालचिम',
+        'मंडिलक': 'मंडलिक',
+        'मिच्छंद्र': 'मच्छिंद्र',
+        'मिच्छंद्रनाथ': 'मच्छिंद्रनाथ',
+        'रिविकरण': 'रविकिरण',
+        'िशविलंग': 'शिवलिंग',
+        'वैिजनाथ': 'वैजिनाथ',
+        'अनुदािनत': 'अनुदानित',
+        'आनुदािनत': 'आनुदानित',
+        'भािगत': 'भागित',
+        'बेिसक': 'बेसिक',
+        'छायािचत्र': 'छायाचित्र',
+        'ज्युिनयर': 'ज्युनियर',
     }
 
     # Pre-compiled regex for speed
@@ -44,6 +80,69 @@ class TranslitHelper:
     RE_ASHVI = re.compile(r'आशिव(ि|इ)?')
     RE_WADI = re.compile(r'([ा-ो])वा(ची|चि)\b')
 
+    # Devanagari consonants (standard, nukta, eyelash ra ऱ, and llla ऴ)
+    DEVANAGARI_CONSONANTS = r'\u0915-\u0939\u0958-\u095F\u0929\u0931\u0934'
+    _C = rf'[{DEVANAGARI_CONSONANTS}]\u093C?'
+    # Consonant cluster: (consonant + virama)* + consonant
+    _CLUSTER = rf'(?:{_C}\u094D[\u200D\u200C]?)*{_C}'
+
+    # Unambiguous visual-order vilanti: \u093F not preceded by a Devanagari consonant
+    RE_UNAMBIGUOUS_VILANTI = re.compile(rf'(?<![{DEVANAGARI_CONSONANTS}])\u093F({_CLUSTER})')
+
+    # All visual-order vilanti: \u093F followed by any consonant cluster
+    RE_ALL_VILANTI = re.compile(rf'\u093F({_CLUSTER})')
+
+    # Visual order indicator: detects if text contains \u093F that is misplaced
+    RE_VISUAL_ORDER_INDICATOR = re.compile(rf'(?:^|[^{DEVANAGARI_CONSONANTS}])\u093F')
+
+    # Visual reph: consonant + matra (ा, े, ै, ो, ौ) + र् -> र् + consonant + matra
+    RE_VISUAL_REPH = re.compile(rf'([{DEVANAGARI_CONSONANTS}]\u093C?)([ाेैोौ])र्')
+
+    @classmethod
+    def fix_marathi_visual_order(cls, text: str, force_all: bool = False) -> str:
+        """
+        Fixes visual-order Devanagari characters, especially the first matra of vilanti
+        (hrasva i vowel sign \\u093F 'ि').
+        
+        In visual-order fonts (e.g. Shree-Lipi, InDesign, legacy PDF font streams),
+        the glyph 'ि' is placed BEFORE the consonant/conjunct it belongs to:
+            e.g. 'ितरपाड' -> 'तिरपाड'
+                 'िवद्यालय' -> 'विद्यालय'
+                 'िप्रया' -> 'प्रिया'
+                 'िस्मता' -> 'स्मिता'
+                 'जोितराम' -> 'जोतिराम'
+                 'सुिप्रया' -> 'सुप्रिया'
+        """
+        if not text:
+            return ""
+        
+        # Remove null bytes or illegal control characters
+        if '\x00' in text:
+            text = text.replace('\x00', '')
+        
+        # 1. Apply known visual-order word corrections
+        for wrong, right in cls.MARATHI_CORRECTIONS.items():
+            if wrong in text:
+                text = text.replace(wrong, right)
+
+        # 2. Fix vilanti (\u093F) that is not preceded by a consonant
+        # (while-loop ensures chained vilantis like 'िदिग्वजय' are fully normalized)
+        if '\u093F' in text:
+            while True:
+                new_text = cls.RE_UNAMBIGUOUS_VILANTI.sub(r'\g<1>' + '\u093F', text)
+                if new_text == text:
+                    break
+                text = new_text
+                
+        # 3. Fix visual reph (e.g. कायार्लय -> कार्यालय, धमार् -> धर्मा, दुगार् -> दुर्गा)
+        if 'र्' in text:
+            text = cls.RE_VISUAL_REPH.sub(r'र्\1\2', text)
+            
+        return text
+
+    # Alias for convenience
+    fix_marathi_vilanti = fix_marathi_visual_order
+
     @staticmethod
     def clean_booth_info(text):
         """
@@ -52,6 +151,9 @@ class TranslitHelper:
         """
         if not text:
             return ""
+        
+        # 0. Fix visual order issues first (e.g. ितरपाड -> तिरपाड, िवद्यालय -> विद्यालय)
+        text = TranslitHelper.fix_marathi_visual_order(text)
         
         # 1. Standardize whitespace
         text = ' '.join(text.split()).strip()
@@ -109,6 +211,9 @@ class TranslitHelper:
         if not text:
             return ""
         
+        # 0. Fix visual order issues first (e.g., ितरपाड -> तिरपाड, िवद्यालय -> विद्यालय)
+        text = TranslitHelper.fix_marathi_visual_order(text)
+        
         # 1. Targeted word replacements for known OCR errors (Fast literal replace)
         for wrong, right in TranslitHelper.MARATHI_CORRECTIONS.items():
             if wrong in text:
@@ -146,6 +251,9 @@ class TranslitHelper:
         """
         if not text:
             return ""
+        
+        if '\x00' in text:
+            text = text.replace('\x00', '')
         
         # Performance Cache Check
         if text in TranslitHelper._translit_cache:
@@ -321,6 +429,48 @@ class TranslitHelper:
                 return v
                 
         return marathi_type
+
+    OCCUPATION_MAP = {
+        'शेतकरी': 'Farmer',
+        'शेती': 'Farmer',
+        'इतर': 'Other',
+        'नोकरी': 'Service',
+        'सेवा': 'Service',
+        'व्यापार': 'Business',
+        'व्यवसाय': 'Business',
+        'धंदा': 'Business',
+        'उद्योग': 'Industry/Business',
+        'खाजगी नोकरी': 'Private Service',
+        'सरकारी नोकरी': 'Govt Service',
+        'गृहिणी': 'Housewife',
+        'शिक्षक': 'Teacher',
+        'शिक्षिका': 'Teacher',
+        'प्राध्यापक': 'Professor',
+        'वकील': 'Lawyer',
+        'डॉक्टर': 'Doctor',
+        'विद्यार्थी': 'Student',
+        'निवृत्त': 'Retired',
+        'मजूर': 'Laborer',
+        'कामगार': 'Worker'
+    }
+
+    @staticmethod
+    def transliterate_occupation(marathi_occ):
+        """
+        Translates or transliterates Marathi occupation to English.
+        """
+        if not marathi_occ:
+            return ""
+        stripped = marathi_occ.strip()
+        # Direct lookup
+        if stripped in TranslitHelper.OCCUPATION_MAP:
+            return TranslitHelper.OCCUPATION_MAP[stripped]
+        # Match if starts with or contains known key
+        for k, v in TranslitHelper.OCCUPATION_MAP.items():
+            if k == stripped or stripped.startswith(k):
+                return v
+        # Fallback to transliteration
+        return TranslitHelper.transliterate_marathi_to_english(stripped)
 
     @staticmethod
     def smart_correct_name(full_name_marathi, relative_name_marathi):
